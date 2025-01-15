@@ -6,17 +6,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pingcap/tidb-tools/pkg/filter"
-	tf "github.com/pingcap/tidb-tools/pkg/table-filter"
-	"github.com/stretchr/testify/require"
-
 	"github.com/pingcap/tidb/br/pkg/version"
 	tcontext "github.com/pingcap/tidb/dumpling/context"
+	"github.com/pingcap/tidb/pkg/util/filter"
+	tf "github.com/pingcap/tidb/pkg/util/table-filter"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFilterTables(t *testing.T) {
-	t.Parallel()
-
 	tctx := tcontext.Background().WithLogger(appLogger)
 	dbTables := DatabaseTables{}
 	expectedDBTables := DatabaseTables{}
@@ -49,8 +46,6 @@ func TestFilterTables(t *testing.T) {
 }
 
 func TestFilterDatabaseWithNoTable(t *testing.T) {
-	t.Parallel()
-
 	dbTables := DatabaseTables{}
 	expectedDBTables := DatabaseTables{}
 

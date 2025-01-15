@@ -9,12 +9,22 @@ PR Title Format:
 -->
 
 ### What problem does this PR solve?
+<!--
+
+Please create an issue first to describe the problem.
+
+There MUST be one line starting with "Issue Number:  " and
+linking the relevant issues via the "close" or "ref".
+
+For more info, check https://pingcap.github.io/tidb-dev-guide/contribute-to-tidb/contribute-code.html#referring-to-an-issue.
+
+-->
 
 Issue Number: close #xxx
 
 Problem Summary:
 
-### What is changed and how it works?
+### What changed and how does it work?
 
 ### Check List
 
@@ -23,7 +33,9 @@ Tests <!-- At least one of them must be included. -->
 - [ ] Unit test
 - [ ] Integration test
 - [ ] Manual test (add detailed scripts or steps below)
-- [ ] No code
+- [ ] No need to test
+  > - [ ] I checked and no code files have been changed.
+  > <!-- Or your custom  "No need to test" reasons -->
 
 Side effects
 
@@ -41,7 +53,9 @@ Documentation
 
 ### Release note
 
-<!-- bugfix or new feature needs a release note -->
+<!-- compatibility change, improvement, bugfix, and new feature need a release note -->
+
+Please refer to [Release Notes Language Style Guide](https://pingcap.github.io/tidb-dev-guide/contribute-to-tidb/release-notes-style-guide.html) to write a quality release note.
 
 ```release-note
 None

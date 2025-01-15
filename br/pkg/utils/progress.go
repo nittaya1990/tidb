@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"go.uber.org/zap"
+	"golang.org/x/term"
 )
 
 type logFunc func(msg string, fields ...zap.Field)
@@ -24,7 +27,9 @@ type ProgressPrinter struct {
 	redirectLog bool
 	progress    int64
 
-	cancel context.CancelFunc
+	closeMu sync.Mutex
+	closeCh chan struct{}
+	closed  chan struct{}
 }
 
 // NewProgressPrinter returns a new progress printer.
@@ -37,9 +42,6 @@ func NewProgressPrinter(
 		name:        name,
 		total:       total,
 		redirectLog: redirectLog,
-		cancel: func() {
-			log.Warn("canceling non-started progress printer")
-		},
 	}
 }
 
@@ -48,9 +50,39 @@ func (pp *ProgressPrinter) Inc() {
 	atomic.AddInt64(&pp.progress, 1)
 }
 
+// IncBy implements glue.Progress
+func (pp *ProgressPrinter) IncBy(cnt int64) {
+	atomic.AddInt64(&pp.progress, cnt)
+}
+
+// GetCurrent get the current progress.
+func (pp *ProgressPrinter) GetCurrent() int64 {
+	return atomic.LoadInt64(&pp.progress)
+}
+
 // Close closes the current progress bar.
 func (pp *ProgressPrinter) Close() {
-	pp.cancel()
+	pp.closeMu.Lock()
+	defer pp.closeMu.Unlock()
+
+	if pp.closeCh != nil {
+		select {
+		case pp.closeCh <- struct{}{}:
+		default:
+		}
+		<-pp.closed
+	} else {
+		log.Warn("closing no-started progress printer")
+	}
+}
+
+// getTerminalOutput try to use os.Stderr as terminal output
+func getTerminalOutput() io.Writer {
+	output := os.Stdout
+	if term.IsTerminal(int(output.Fd())) {
+		return output
+	}
+	return nil
 }
 
 // goPrintProgress starts a gorouinte and prints progress.
@@ -59,10 +91,12 @@ func (pp *ProgressPrinter) goPrintProgress(
 	logFuncImpl logFunc,
 	testWriter io.Writer, // Only for tests
 ) {
-	cctx, cancel := context.WithCancel(ctx)
-	pp.cancel = cancel
+	var terminalOutput io.Writer
+	if !pp.redirectLog && testWriter == nil {
+		terminalOutput = getTerminalOutput()
+	}
 	bar := pb.New64(pp.total)
-	if pp.redirectLog || testWriter != nil {
+	if terminalOutput == nil {
 		tmpl := `{"P":"{{percent .}}","C":"{{counters . }}","E":"{{etime .}}","R":"{{rtime .}}","S":"{{speed .}}"}`
 		bar.SetTemplateString(tmpl)
 		bar.SetRefreshRate(2 * time.Minute)
@@ -79,6 +113,7 @@ func (pp *ProgressPrinter) goPrintProgress(
 		tmpl := `{{string . "barName" | green}} {{ bar . "<" "-" (cycle . "-" "\\" "|" "/" ) "." ">"}} {{percent .}}`
 		bar.SetTemplateString(tmpl)
 		bar.Set("barName", pp.name)
+		bar.SetWriter(terminalOutput)
 	}
 	if testWriter != nil {
 		bar.SetWriter(testWriter)
@@ -86,20 +121,27 @@ func (pp *ProgressPrinter) goPrintProgress(
 	}
 	bar.Start()
 
+	closeCh := make(chan struct{}, 1)
+	closed := make(chan struct{})
+	pp.closeMu.Lock()
+	pp.closeCh = closeCh
+	pp.closed = closed
+	pp.closeMu.Unlock()
 	go func() {
+		defer close(closed)
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
 		defer bar.Finish()
 
 		for {
 			select {
-			case <-cctx.Done():
+			case <-ctx.Done():
 				// a hacky way to adapt the old behavior:
-				// when canceled by the outer context, leave the progress unchanged.
+				// when canceled by the context, leave the progress unchanged.
+				return
+			case <-closeCh:
+				// a hacky way to adapt the old behavior:
 				// when canceled by Close method (the 'internal' way), push the progress to 100%.
-				if ctx.Err() != nil {
-					return
-				}
 				bar.SetCurrent(pp.total)
 				return
 			case <-t.C:

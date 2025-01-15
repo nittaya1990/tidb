@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -eu
+set -eux
 DB="$TEST_NAME"
 
 run_sql "CREATE DATABASE $DB;"
@@ -36,6 +36,7 @@ run_br --pd $PD_ADDR backup full -s "local://$TEST_DIR/$DB"
 
 # Test debug decode
 run_br -s "local://$TEST_DIR/$DB" debug decode --field "Schemas"
+run_br -s "local://$TEST_DIR/$DB" debug decode --field "SchemaIndex"
 run_br -s "local://$TEST_DIR/$DB" debug decode --field "EndVersion"
 # Ensure compatibility
 run_br -s "local://$TEST_DIR/$DB" validate decode --field "end-version"
@@ -43,6 +44,8 @@ run_br -s "local://$TEST_DIR/$DB" validate decode --field "end-version"
 # Test redact-log and redact-info-log compalibility
 run_br -s "local://$TEST_DIR/$DB" debug decode --field "Schemas" --redact-log=true
 run_br -s "local://$TEST_DIR/$DB" debug decode --field "Schemas" --redact-info-log=true
+run_br -s "local://$TEST_DIR/$DB" debug decode --field "SchemaIndex" --redact-log=true
+run_br -s "local://$TEST_DIR/$DB" debug decode --field "SchemaIndex" --redact-info-log=true
 
 # Test validate backupmeta
 run_br debug backupmeta validate -s "local://$TEST_DIR/$DB"
@@ -52,7 +55,7 @@ run_br debug backupmeta validate -s "local://$TEST_DIR/$DB" --offset 100
 run_br validate checksum -s "local://$TEST_DIR/$DB"
 
 # Test validate checksum
-for sst in $TEST_DIR/$DB/*.sst; do
+for sst in $TEST_DIR/$DB/*/*.sst; do
     echo "corrupted!" >> $sst
     echo "$sst corrupted!"
     break
@@ -68,19 +71,20 @@ fi
 # backup full with ratelimit = 1 to make sure this backup task won't finish quickly
 echo "backup start to test lock file"
 PPROF_PORT=6080
+# not easy to trap USR1 signal in our custom run_br, so we use the original run_br to run the backup command
 GO_FAILPOINTS="github.com/pingcap/tidb/br/pkg/utils/determined-pprof-port=return($PPROF_PORT)" \
-run_br --pd $PD_ADDR backup full -s "local://$TEST_DIR/$DB/lock" \
+$UTILS_DIR/run_br --pd $PD_ADDR backup full -s "local://$TEST_DIR/$DB/lock" \
     --remove-schedulers \
     --ratelimit 1 \
-    --ratelimit-unit 1 \
-    --concurrency 4 &> $TEST_DIR/br-other-stdout.log & # It will be killed after test finish.
+    --ratelimit-unit 1 &> $TEST_DIR/br-other-stdout.log & # It will be killed after test finish.
 
 # record last backup pid
 _pid=$!
 
 # give the former backup some time to write down lock file (and initialize signal listener).
 sleep 1
-pkill -10 -P $_pid
+# don't use numeric value as it's mapped differently on different unix like system
+pkill -USR1 -P $_pid
 echo "starting pprof..."
 
 # give the former backup some time to write down lock file (and start pprof server).
@@ -89,12 +93,25 @@ run_curl "https://localhost:$PPROF_PORT/debug/pprof/trace?seconds=1" &>/dev/null
 echo "pprof started..."
 
 run_curl https://$PD_ADDR/pd/api/v1/config/schedule | grep '"disable": false'
-run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."enable-location-replacement"' | grep "false"
-run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."max-pending-peer-count"' | grep "2147483647"
-run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."max-merge-region-size"' | grep -E "^0$"
-run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."max-merge-region-keys"' | grep -E "^0$"
+
+# after apply the pause api. these configs won't change any more.
+# run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."enable-location-replacement"' | grep "false"
+# run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."max-pending-peer-count"' | grep "2147483647"
+# run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."merge-schedule-limit"' | grep -E "^0$"
+
+# after https://github.com/tikv/pd/pull/4781 merged.
+# we can use a hack way to check whether we pause config succeed.
+# By setting a paused config again and expect to fail with a clear message.
+run_pd_ctl -u https://$PD_ADDR config set max-pending-peer-count 0 | grep -q "need to clean up TTL first for schedule.max-pending-peer-count"
+run_pd_ctl -u https://$PD_ADDR config set enable-location-replacement false | grep -q "need to clean up TTL first for schedule.enable-location-replacement"
+run_pd_ctl -u https://$PD_ADDR config set merge-schedule-limit 0 | grep -q "need to clean up TTL first for schedule.merge-schedule-limit"
+run_pd_ctl -u https://$PD_ADDR config set leader-schedule-limit 0 | grep -q "need to clean up TTL first for schedule.leader-schedule-limit"
+run_pd_ctl -u https://$PD_ADDR config set region-schedule-limit 0 | grep -q "need to clean up TTL first for schedule.region-schedule-limit"
+run_pd_ctl -u https://$PD_ADDR config set max-snapshot-count 0 | grep -q "need to clean up TTL first for schedule.max-snapshot-count"
 
 backup_fail=0
+# generate 1.sst to make another backup failed.
+touch "$TEST_DIR/$DB/lock/1.sst"
 echo "another backup start expect to fail due to last backup add a lockfile"
 run_br --pd $PD_ADDR backup full -s "local://$TEST_DIR/$DB/lock" --concurrency 4 || backup_fail=1
 if [ "$backup_fail" -ne "1" ];then
@@ -132,8 +149,7 @@ fi
 
 
 default_pd_values='{
-  "max-merge-region-keys": 200000,
-  "max-merge-region-size": 20,
+  "merge-schedule-limit": 8,
   "leader-schedule-limit": 4,
   "region-schedule-limit": 2048
 }'
@@ -148,14 +164,14 @@ done
 
 
 # check is there still exists scheduler in pause.
-pause_schedulers=$(curl https://$PD_ADDR/pd/api/v1/schedulers?status="paused" | grep "scheduler" | wc -l)
+pause_schedulers=$(run_curl https://$PD_ADDR/pd/api/v1/schedulers?status="paused" | grep "scheduler" | wc -l)
  # There shouldn't be any paused schedulers since BR gracfully shutdown.
  if [ "$pause_schedulers" -ne "0" ];then
   echo "TEST: [$TEST_NAME] failed because paused scheduler has changed"
   exit 1
 fi
 
-pd_settings=6
+pd_settings=5
 
 # balance-region scheduler enabled
 run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."schedulers-v2"[] | {disable: .disable, type: ."type" | select (.=="balance-region")}' | grep '"disable": false' || ((pd_settings--))
@@ -170,13 +186,10 @@ run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."enable-location-repl
 # until pd has the solution to temporary set these scheduler/configs.
 run_br validate reset-pd-config-as-default --pd $PD_ADDR
 
-# max-merge-region-size set to default 20
-run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."max-merge-region-size"' | grep "20" || ((pd_settings--))
+# merge-schedule-limit set to default 8
+run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."merge-schedule-limit"' | grep "8" || ((pd_settings--))
 
-# max-merge-region-keys set to default 200000
-run_curl https://$PD_ADDR/pd/api/v1/config/schedule | jq '."max-merge-region-keys"' | grep "200000" || ((pd_settings--))
-
-if [ "$pd_settings" -ne "6" ];then
+if [ "$pd_settings" -ne "5" ];then
     echo "TEST: [$TEST_NAME] test validate reset pd config failed!"
     exit 1
 fi

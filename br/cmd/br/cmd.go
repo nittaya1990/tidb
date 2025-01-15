@@ -5,23 +5,29 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	tidbutils "github.com/pingcap/tidb-tools/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/gluetidb"
-	"github.com/pingcap/tidb/br/pkg/redact"
 	"github.com/pingcap/tidb/br/pkg/summary"
 	"github.com/pingcap/tidb/br/pkg/task"
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/version/build"
-	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/pkg/config"
+	tidbutils "github.com/pingcap/tidb/pkg/util"
+	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/pingcap/tidb/pkg/util/memory"
+	"github.com/pingcap/tidb/pkg/util/redact"
+	"github.com/pingcap/tidb/pkg/util/size"
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 )
 
 var (
@@ -35,6 +41,15 @@ var (
 		"*.*",
 		fmt.Sprintf("!%s.*", utils.TemporaryDBName("*")),
 		"!mysql.*",
+		"mysql.bind_info",
+		"mysql.user",
+		"mysql.db",
+		"mysql.tables_priv",
+		"mysql.columns_priv",
+		"mysql.global_priv",
+		"mysql.global_grants",
+		"mysql.default_roles",
+		"mysql.role_edges",
 		"!sys.*",
 		"!INFORMATION_SCHEMA.*",
 		"!PERFORMANCE_SCHEMA.*",
@@ -70,8 +85,8 @@ func timestampLogFileName() string {
 	return filepath.Join(os.TempDir(), time.Now().Format("br.log.2006-01-02T15.04.05Z0700"))
 }
 
-// AddFlags adds flags to the given cmd.
-func AddFlags(cmd *cobra.Command) {
+// DefineCommonFlags defines the common flags for all BR cmd operation.
+func DefineCommonFlags(cmd *cobra.Command) {
 	cmd.Version = build.Info()
 	cmd.Flags().BoolP(flagVersion, flagVersionShort, false, "Display version information about BR")
 	cmd.SetVersionTemplate("{{printf \"%s\" .Version}}\n")
@@ -88,12 +103,33 @@ func AddFlags(cmd *cobra.Command) {
 		"Set whether to redact sensitive info in log")
 	cmd.PersistentFlags().String(FlagStatusAddr, "",
 		"Set the HTTP listening address for the status report service. Set to empty string to disable")
+
+	// defines BR task common flags, this is shared by cmd and sql(brie)
 	task.DefineCommonFlags(cmd.PersistentFlags())
 
 	cmd.PersistentFlags().StringP(FlagSlowLogFile, "", "",
 		"Set the slow log file path. If not set, discard slow logs")
 	_ = cmd.PersistentFlags().MarkHidden(FlagSlowLogFile)
 	_ = cmd.PersistentFlags().MarkHidden(FlagRedactLog)
+}
+
+const quarterGiB uint64 = 256 * size.MB
+const halfGiB uint64 = 512 * size.MB
+const fourGiB uint64 = 4 * size.GB
+
+func calculateMemoryLimit(memleft uint64) uint64 {
+	// memreserved = f(memleft) = 512MB * memleft / (memleft + 4GB)
+	//  * f(0) = 0
+	//  * f(4GB) = 256MB
+	//  * f(+inf) -> 512MB
+	memreserved := halfGiB / (1 + fourGiB/(memleft|1))
+	// 0     memused          memtotal-memreserved  memtotal
+	// +--------+--------------------+----------------+
+	//          ^            br mem upper limit
+	//          +--------------------^
+	//             GOMEMLIMIT range
+	memlimit := memleft - memreserved
+	return memlimit
 }
 
 // Init initializes BR cli.
@@ -111,9 +147,8 @@ func Init(cmd *cobra.Command) (err error) {
 			// otherwise the info will be print in stdout...
 			tidbLogCfg.File.Filename = timestampLogFileName()
 		} else {
-			// Disable annoying TiDB Log.
-			// TODO: some error logs outputs randomly, we need to fix them in TiDB.
-			tidbLogCfg.Level = "fatal"
+			// Don't print slow log in br
+			config.GetGlobalConfig().Instance.EnableSlowLog.Store(false)
 		}
 		e = logutil.InitLogger(&tidbLogCfg)
 		if e != nil {
@@ -151,6 +186,35 @@ func Init(cmd *cobra.Command) (err error) {
 			return
 		}
 		log.ReplaceGlobals(lg, p)
+		memory.InitMemoryHook()
+		if debug.SetMemoryLimit(-1) == math.MaxInt64 {
+			memtotal, e := memory.MemTotal()
+			if e != nil {
+				err = e
+				return
+			}
+			memused, e := memory.MemUsed()
+			if e != nil {
+				err = e
+				return
+			}
+			if memused >= memtotal {
+				log.Warn("failed to obtain memory size, skip setting memory limit",
+					zap.Uint64("memused", memused), zap.Uint64("memtotal", memtotal))
+			} else {
+				memleft := memtotal - memused
+				memlimit := calculateMemoryLimit(memleft)
+				// BR command needs 256 MiB at least, if the left memory is less than 256 MiB,
+				// the memory limit cannot limit anyway and then finally OOM.
+				memlimit = max(memlimit, quarterGiB)
+				log.Info("calculate the rest memory",
+					zap.Uint64("memtotal", memtotal), zap.Uint64("memused", memused), zap.Uint64("memlimit", memlimit))
+				// No need to set memory limit because the left memory is sufficient.
+				if memlimit < uint64(math.MaxInt64) {
+					debug.SetMemoryLimit(int64(memlimit))
+				}
+			}
+		}
 
 		redactLog, e := cmd.Flags().GetBool(FlagRedactLog)
 		if e != nil {

@@ -8,10 +8,10 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"go.uber.org/zap"
-
+	"github.com/pingcap/tidb/br/pkg/utils"
 	tcontext "github.com/pingcap/tidb/dumpling/context"
+	"github.com/pingcap/tidb/pkg/util/dbutil"
+	"go.uber.org/zap"
 )
 
 const (
@@ -23,9 +23,14 @@ const (
 	ErrNoSuchTable uint16 = 1146
 )
 
-func newDumpChunkBackoffer(shouldRetry bool) *dumpChunkBackoffer { // revive:disable-line:flag-parameter
+type backOfferResettable interface {
+	utils.BackoffStrategy
+	Reset()
+}
+
+func newRebuildConnBackOffer(shouldRetry bool) backOfferResettable { // revive:disable-line:flag-parameter
 	if !shouldRetry {
-		return &dumpChunkBackoffer{
+		return &noopBackoffer{
 			attempt: 1,
 		}
 	}
@@ -47,10 +52,6 @@ func (b *dumpChunkBackoffer) NextBackoff(err error) time.Duration {
 	if _, ok := err.(*mysql.MySQLError); ok && !dbutil.IsRetryableError(err) {
 		b.attempt = 0
 		return 0
-	} else if _, ok := err.(*writerError); ok {
-		// the uploader writer's retry logic is already done in aws client. needn't retry here
-		b.attempt = 0
-		return 0
 	}
 	b.delayTime = 2 * b.delayTime
 	b.attempt--
@@ -60,11 +61,40 @@ func (b *dumpChunkBackoffer) NextBackoff(err error) time.Duration {
 	return b.delayTime
 }
 
-func (b *dumpChunkBackoffer) Attempt() int {
+func (b *dumpChunkBackoffer) RemainingAttempts() int {
 	return b.attempt
 }
 
-func newLockTablesBackoffer(tctx *tcontext.Context, blockList map[string]map[string]interface{}) *lockTablesBackoffer {
+func (b *dumpChunkBackoffer) Reset() {
+	b.attempt = dumpChunkRetryTime
+	b.delayTime = dumpChunkWaitInterval
+}
+
+type noopBackoffer struct {
+	attempt int
+}
+
+func (b *noopBackoffer) NextBackoff(_ error) time.Duration {
+	b.attempt--
+	return time.Duration(0)
+}
+
+func (b *noopBackoffer) RemainingAttempts() int {
+	return b.attempt
+}
+
+func (b *noopBackoffer) Reset() {
+	b.attempt = 1
+}
+
+func newLockTablesBackoffer(tctx *tcontext.Context, blockList map[string]map[string]any, conf *Config) *lockTablesBackoffer {
+	if conf.SpecifiedTables {
+		return &lockTablesBackoffer{
+			tctx:      tctx,
+			attempt:   1,
+			blockList: blockList,
+		}
+	}
 	return &lockTablesBackoffer{
 		tctx:      tctx,
 		attempt:   lockTablesRetryTime,
@@ -75,7 +105,7 @@ func newLockTablesBackoffer(tctx *tcontext.Context, blockList map[string]map[str
 type lockTablesBackoffer struct {
 	tctx      *tcontext.Context
 	attempt   int
-	blockList map[string]map[string]interface{}
+	blockList map[string]map[string]any
 }
 
 func (b *lockTablesBackoffer) NextBackoff(err error) time.Duration {
@@ -89,7 +119,7 @@ func (b *lockTablesBackoffer) NextBackoff(err error) time.Duration {
 			return 0
 		}
 		if _, ok := b.blockList[db]; !ok {
-			b.blockList[db] = make(map[string]interface{})
+			b.blockList[db] = make(map[string]any)
 		}
 		b.blockList[db][table] = struct{}{}
 		return 0
@@ -98,7 +128,7 @@ func (b *lockTablesBackoffer) NextBackoff(err error) time.Duration {
 	return 0
 }
 
-func (b *lockTablesBackoffer) Attempt() int {
+func (b *lockTablesBackoffer) RemainingAttempts() int {
 	return b.attempt
 }
 

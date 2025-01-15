@@ -10,23 +10,27 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
-	"go.uber.org/zap"
-
-	dbconfig "github.com/pingcap/tidb/config"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/br/pkg/version"
 	tcontext "github.com/pingcap/tidb/dumpling/context"
 	"github.com/pingcap/tidb/dumpling/log"
-	"github.com/pingcap/tidb/parser/model"
-	"github.com/pingcap/tidb/store/helper"
+	dbconfig "github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/errno"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	pd "github.com/tikv/pd/client/http"
+	"go.uber.org/multierr"
+	"go.uber.org/zap"
 )
 
 const (
 	orderByTiDBRowID = "ORDER BY `_tidb_rowid`"
+	snapshotVar      = "tidb_snapshot"
 )
 
 type listTableType int
@@ -57,44 +61,63 @@ func ShowTables(db *sql.Conn) ([]string, error) {
 
 // ShowCreateDatabase constructs the create database SQL for a specified database
 // returns (createDatabaseSQL, error)
-func ShowCreateDatabase(db *sql.Conn, database string) (string, error) {
+func ShowCreateDatabase(tctx *tcontext.Context, db *BaseConn, database string) (string, error) {
 	var oneRow [2]string
 	handleOneRow := func(rows *sql.Rows) error {
 		return rows.Scan(&oneRow[0], &oneRow[1])
 	}
 	query := fmt.Sprintf("SHOW CREATE DATABASE `%s`", escapeString(database))
-	err := simpleQuery(db, query, handleOneRow)
-	if mysqlErr, ok := errors.Cause(err).(*mysql.MySQLError); ok {
-		// Falling back to simple create statement for MemSQL/SingleStore, because of this:
-		// ERROR 1706 (HY000): Feature 'SHOW CREATE DATABASE' is not supported by MemSQL.
-		if mysqlErr.Number == 1706 {
-			return fmt.Sprintf("CREATE DATABASE `%s`", escapeString(database)), nil
+	err := db.QuerySQL(tctx, handleOneRow, func() {
+		oneRow[0], oneRow[1] = "", ""
+	}, query)
+	if multiErrs := multierr.Errors(err); len(multiErrs) > 0 {
+		for _, multiErr := range multiErrs {
+			if mysqlErr, ok := errors.Cause(multiErr).(*mysql.MySQLError); ok {
+				// Falling back to simple create statement for MemSQL/SingleStore, because of this:
+				// ERROR 1706 (HY000): Feature 'SHOW CREATE DATABASE' is not supported by MemSQL.
+				if strings.Contains(mysqlErr.Error(), "SHOW CREATE DATABASE") {
+					return fmt.Sprintf("CREATE DATABASE `%s`", escapeString(database)), nil
+				}
+			}
 		}
 	}
-	if err != nil {
-		return "", errors.Annotatef(err, "sql: %s", query)
-	}
-	return oneRow[1], nil
+	return oneRow[1], err
 }
 
 // ShowCreateTable constructs the create table SQL for a specified table
 // returns (createTableSQL, error)
-func ShowCreateTable(db *sql.Conn, database, table string) (string, error) {
+func ShowCreateTable(tctx *tcontext.Context, db *BaseConn, database, table string) (string, error) {
 	var oneRow [2]string
 	handleOneRow := func(rows *sql.Rows) error {
 		return rows.Scan(&oneRow[0], &oneRow[1])
 	}
 	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", escapeString(database), escapeString(table))
-	err := simpleQuery(db, query, handleOneRow)
+	err := db.QuerySQL(tctx, handleOneRow, func() {
+		oneRow[0], oneRow[1] = "", ""
+	}, query)
 	if err != nil {
-		return "", errors.Annotatef(err, "sql: %s", query)
+		return "", err
 	}
 	return oneRow[1], nil
 }
 
+// ShowCreatePlacementPolicy constructs the create policy SQL for a specified table
+// returns (createPolicySQL, error)
+func ShowCreatePlacementPolicy(tctx *tcontext.Context, db *BaseConn, policy string) (string, error) {
+	var oneRow [2]string
+	handleOneRow := func(rows *sql.Rows) error {
+		return rows.Scan(&oneRow[0], &oneRow[1])
+	}
+	query := fmt.Sprintf("SHOW CREATE PLACEMENT POLICY `%s`", escapeString(policy))
+	err := db.QuerySQL(tctx, handleOneRow, func() {
+		oneRow[0], oneRow[1] = "", ""
+	}, query)
+	return oneRow[1], err
+}
+
 // ShowCreateView constructs the create view SQL for a specified view
 // returns (createFakeTableSQL, createViewSQL, error)
-func ShowCreateView(db *sql.Conn, database, view string) (createFakeTableSQL string, createRealViewSQL string, err error) {
+func ShowCreateView(tctx *tcontext.Context, db *BaseConn, database, view string) (createFakeTableSQL string, createRealViewSQL string, err error) {
 	var fieldNames []string
 	handleFieldRow := func(rows *sql.Rows) error {
 		var oneRow [6]sql.NullString
@@ -115,9 +138,11 @@ func ShowCreateView(db *sql.Conn, database, view string) (createFakeTableSQL str
 
 	// Build createTableSQL
 	query := fmt.Sprintf("SHOW FIELDS FROM `%s`.`%s`", escapeString(database), escapeString(view))
-	err = simpleQuery(db, query, handleFieldRow)
+	err = db.QuerySQL(tctx, handleFieldRow, func() {
+		fieldNames = []string{}
+	}, query)
 	if err != nil {
-		return "", "", errors.Annotatef(err, "sql: %s", query)
+		return "", "", err
 	}
 	fmt.Fprintf(&createTableSQL, "CREATE TABLE `%s`(\n", escapeString(view))
 	createTableSQL.WriteString(strings.Join(fieldNames, ",\n"))
@@ -127,9 +152,13 @@ func ShowCreateView(db *sql.Conn, database, view string) (createFakeTableSQL str
 	fmt.Fprintf(&createViewSQL, "DROP TABLE IF EXISTS `%s`;\n", escapeString(view))
 	fmt.Fprintf(&createViewSQL, "DROP VIEW IF EXISTS `%s`;\n", escapeString(view))
 	query = fmt.Sprintf("SHOW CREATE VIEW `%s`.`%s`", escapeString(database), escapeString(view))
-	err = simpleQuery(db, query, handleOneRow)
+	err = db.QuerySQL(tctx, handleOneRow, func() {
+		for i := range oneRow {
+			oneRow[i] = ""
+		}
+	}, query)
 	if err != nil {
-		return "", "", errors.Annotatef(err, "sql: %s", query)
+		return "", "", err
 	}
 	// The result for `show create view` SQL
 	// mysql> show create view v1;
@@ -144,6 +173,60 @@ func ShowCreateView(db *sql.Conn, database, view string) (createFakeTableSQL str
 	RestoreCharset(&createViewSQL)
 
 	return createTableSQL.String(), createViewSQL.String(), nil
+}
+
+// ShowCreateSequence constructs the create sequence SQL for a specified sequence
+// returns (createSequenceSQL, error)
+func ShowCreateSequence(tctx *tcontext.Context, db *BaseConn, database, sequence string, conf *Config) (string, error) {
+	var oneRow [2]string
+	handleOneRow := func(rows *sql.Rows) error {
+		return rows.Scan(&oneRow[0], &oneRow[1])
+	}
+	var (
+		createSequenceSQL  strings.Builder
+		nextNotCachedValue int64
+	)
+	query := fmt.Sprintf("SHOW CREATE SEQUENCE `%s`.`%s`", escapeString(database), escapeString(sequence))
+	err := db.QuerySQL(tctx, handleOneRow, func() {
+		oneRow[0], oneRow[1] = "", ""
+	}, query)
+	if err != nil {
+		return "", err
+	}
+	createSequenceSQL.WriteString(oneRow[1])
+	createSequenceSQL.WriteString(";\n")
+
+	switch conf.ServerInfo.ServerType {
+	case version.ServerTypeTiDB:
+		// Get next not allocated auto increment id of the whole cluster
+		query := fmt.Sprintf("SHOW TABLE `%s`.`%s` NEXT_ROW_ID", escapeString(database), escapeString(sequence))
+		results, err := db.QuerySQLWithColumns(tctx, []string{"NEXT_GLOBAL_ROW_ID", "ID_TYPE"}, query)
+		if err != nil {
+			return "", err
+		}
+		for _, oneRow := range results {
+			nextGlobalRowID, idType := oneRow[0], oneRow[1]
+			if idType == "SEQUENCE" {
+				nextNotCachedValue, _ = strconv.ParseInt(nextGlobalRowID, 10, 64)
+			}
+		}
+		fmt.Fprintf(&createSequenceSQL, "SELECT SETVAL(`%s`,%d);\n", escapeString(sequence), nextNotCachedValue)
+	case version.ServerTypeMariaDB:
+		var oneRow1 string
+		handleOneRow1 := func(rows *sql.Rows) error {
+			return rows.Scan(&oneRow1)
+		}
+		query := fmt.Sprintf("SELECT NEXT_NOT_CACHED_VALUE FROM `%s`.`%s`", escapeString(database), escapeString(sequence))
+		err := db.QuerySQL(tctx, handleOneRow1, func() {
+			oneRow1 = ""
+		}, query)
+		if err != nil {
+			return "", err
+		}
+		nextNotCachedValue, _ = strconv.ParseInt(oneRow1, 10, 64)
+		fmt.Fprintf(&createSequenceSQL, "SELECT SETVAL(`%s`,%d);\n", escapeString(sequence), nextNotCachedValue)
+	}
+	return createSequenceSQL.String(), nil
 }
 
 // SetCharset builds the set charset SQLs
@@ -164,6 +247,119 @@ func RestoreCharset(w io.StringWriter) {
 	_, _ = w.WriteString("SET collation_connection = @PREV_COLLATION_CONNECTION;\n")
 }
 
+// updateSpecifiedTablesMeta updates DatabaseTables with correct table type and avg row size.
+func updateSpecifiedTablesMeta(tctx *tcontext.Context, db *sql.Conn, dbTables DatabaseTables, listType listTableType) error {
+	var (
+		schema, table, tableTypeStr string
+		tableType                   TableType
+		avgRowLength                uint64
+		err                         error
+	)
+	switch listType {
+	case listTableByInfoSchema:
+		dbNames := make([]string, 0, len(dbTables))
+		for db := range dbTables {
+			dbNames = append(dbNames, fmt.Sprintf("'%s'", db))
+		}
+		query := fmt.Sprintf("SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA IN (%s)", strings.Join(dbNames, ","))
+		if err := simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
+			var (
+				sqlAvgRowLength sql.NullInt64
+				err2            error
+			)
+			if err2 = rows.Scan(&schema, &table, &tableTypeStr, &sqlAvgRowLength); err != nil {
+				return errors.Trace(err2)
+			}
+
+			tbls, ok := dbTables[schema]
+			if !ok {
+				return nil
+			}
+			for _, tbl := range tbls {
+				if tbl.Name == table {
+					tableType, err2 = ParseTableType(tableTypeStr)
+					if err2 != nil {
+						return errors.Trace(err2)
+					}
+					if sqlAvgRowLength.Valid {
+						avgRowLength = uint64(sqlAvgRowLength.Int64)
+					} else {
+						avgRowLength = 0
+					}
+					tbl.Type = tableType
+					tbl.AvgRowLength = avgRowLength
+				}
+			}
+			return nil
+		}, query); err != nil {
+			return errors.Annotatef(err, "sql: %s", query)
+		}
+		return nil
+	case listTableByShowFullTables:
+		for schema, tbls := range dbTables {
+			query := fmt.Sprintf("SHOW FULL TABLES FROM `%s`",
+				escapeString(schema))
+			if err := simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
+				var err2 error
+				if err2 = rows.Scan(&table, &tableTypeStr); err != nil {
+					return errors.Trace(err2)
+				}
+				for _, tbl := range tbls {
+					if tbl.Name == table {
+						tableType, err2 = ParseTableType(tableTypeStr)
+						if err2 != nil {
+							return errors.Trace(err2)
+						}
+						tbl.Type = tableType
+					}
+				}
+				return nil
+			}, query); err != nil {
+				return errors.Annotatef(err, "sql: %s", query)
+			}
+		}
+		return nil
+	default:
+		const queryTemplate = "SHOW TABLE STATUS FROM `%s`"
+		for schema, tbls := range dbTables {
+			query := fmt.Sprintf(queryTemplate, escapeString(schema))
+			rows, err := db.QueryContext(tctx, query)
+			if err != nil {
+				return errors.Annotatef(err, "sql: %s", query)
+			}
+			results, err := GetSpecifiedColumnValuesAndClose(rows, "NAME", "ENGINE", "AVG_ROW_LENGTH", "COMMENT")
+			if err != nil {
+				return errors.Annotatef(err, "sql: %s", query)
+			}
+			for _, oneRow := range results {
+				table, engine, avgRowLengthStr, comment := oneRow[0], oneRow[1], oneRow[2], oneRow[3]
+				for _, tbl := range tbls {
+					if tbl.Name == table {
+						if avgRowLengthStr != "" {
+							avgRowLength, err = strconv.ParseUint(avgRowLengthStr, 10, 64)
+							if err != nil {
+								return errors.Annotatef(err, "sql: %s", query)
+							}
+						} else {
+							avgRowLength = 0
+						}
+						tbl.AvgRowLength = avgRowLength
+						tableType = TableTypeBase
+						if engine == "" && (comment == "" || comment == TableTypeViewStr) {
+							tableType = TableTypeView
+						} else if engine == "" {
+							tctx.L().Warn("invalid table without engine found", zap.String("database", schema), zap.String("table", table))
+							continue
+						}
+						tbl.Type = tableType
+					}
+				}
+			}
+		}
+		return nil
+	}
+}
+
 // ListAllDatabasesTables lists all the databases and tables from the database
 // listTableByInfoSchema list tables by table information_schema in MySQL
 // listTableByShowTableStatus has better performance than listTableByInfoSchema
@@ -172,10 +368,10 @@ func ListAllDatabasesTables(tctx *tcontext.Context, db *sql.Conn, databaseNames 
 	listType listTableType, tableTypes ...TableType) (DatabaseTables, error) { // revive:disable-line:flag-parameter
 	dbTables := DatabaseTables{}
 	var (
-		schema, table, tableTypeStr string
-		tableType                   TableType
-		avgRowLength                uint64
-		err                         error
+		table, tableTypeStr string
+		tableType           TableType
+		avgRowLength        uint64
+		err                 error
 	)
 
 	tableTypeConditions := make([]string, len(tableTypes))
@@ -184,42 +380,39 @@ func ListAllDatabasesTables(tctx *tcontext.Context, db *sql.Conn, databaseNames 
 	}
 	switch listType {
 	case listTableByInfoSchema:
-		query := fmt.Sprintf("SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE %s", strings.Join(tableTypeConditions, " OR "))
 		for _, schema := range databaseNames {
+			query := fmt.Sprintf("SELECT TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=? AND (%s)", strings.Join(tableTypeConditions, " OR "))
 			dbTables[schema] = make([]*TableInfo, 0)
-		}
-		if err = simpleQueryWithArgs(db, func(rows *sql.Rows) error {
-			var (
-				sqlAvgRowLength sql.NullInt64
-				err2            error
-			)
-			if err2 = rows.Scan(&schema, &table, &tableTypeStr, &sqlAvgRowLength); err != nil {
-				return errors.Trace(err2)
-			}
-			tableType, err2 = ParseTableType(tableTypeStr)
-			if err2 != nil {
-				return errors.Trace(err2)
-			}
+			if err = simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
+				var (
+					sqlAvgRowLength sql.NullInt64
+					err2            error
+				)
+				if err2 = rows.Scan(&table, &tableTypeStr, &sqlAvgRowLength); err != nil {
+					return errors.Trace(err2)
+				}
+				tableType, err2 = ParseTableType(tableTypeStr)
+				if err2 != nil {
+					return errors.Trace(err2)
+				}
 
-			if sqlAvgRowLength.Valid {
-				avgRowLength = uint64(sqlAvgRowLength.Int64)
-			} else {
-				avgRowLength = 0
-			}
-			// only append tables to schemas in databaseNames
-			if _, ok := dbTables[schema]; ok {
+				if sqlAvgRowLength.Valid {
+					avgRowLength = uint64(sqlAvgRowLength.Int64)
+				} else {
+					avgRowLength = 0
+				}
 				dbTables[schema] = append(dbTables[schema], &TableInfo{table, avgRowLength, tableType})
+				return nil
+			}, query, schema); err != nil {
+				return nil, errors.Annotatef(err, "sql: %s", query)
 			}
-			return nil
-		}, query); err != nil {
-			return nil, errors.Annotatef(err, "sql: %s", query)
 		}
 	case listTableByShowFullTables:
-		for _, schema = range databaseNames {
+		for _, schema := range databaseNames {
 			dbTables[schema] = make([]*TableInfo, 0)
 			query := fmt.Sprintf("SHOW FULL TABLES FROM `%s` WHERE %s",
 				escapeString(schema), strings.Join(tableTypeConditions, " OR "))
-			if err = simpleQueryWithArgs(db, func(rows *sql.Rows) error {
+			if err = simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
 				var err2 error
 				if err2 = rows.Scan(&table, &tableTypeStr); err != nil {
 					return errors.Trace(err2)
@@ -241,7 +434,7 @@ func ListAllDatabasesTables(tctx *tcontext.Context, db *sql.Conn, databaseNames 
 		for _, tableType = range tableTypes {
 			selectedTableType[tableType] = struct{}{}
 		}
-		for _, schema = range databaseNames {
+		for _, schema := range databaseNames {
 			dbTables[schema] = make([]*TableInfo, 0)
 			query := fmt.Sprintf(queryTemplate, escapeString(schema))
 			rows, err := db.QueryContext(tctx, query)
@@ -277,6 +470,24 @@ func ListAllDatabasesTables(tctx *tcontext.Context, db *sql.Conn, databaseNames 
 		}
 	}
 	return dbTables, nil
+}
+
+// ListAllPlacementPolicyNames returns all placement policy names.
+func ListAllPlacementPolicyNames(tctx *tcontext.Context, db *BaseConn) ([]string, error) {
+	var policyList []string
+	var policy string
+	const query = "select distinct policy_name from information_schema.placement_policies where policy_name is not null;"
+	err := db.QuerySQL(tctx, func(rows *sql.Rows) error {
+		err := rows.Scan(&policy)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		policyList = append(policyList, policy)
+		return nil
+	}, func() {
+		policyList = policyList[:0]
+	}, query)
+	return policyList, errors.Annotatef(err, "sql: %s", query)
 }
 
 // SelectVersion gets the version information from the database server
@@ -336,14 +547,14 @@ func buildSelectQuery(database, table, fields, partition, where, orderByClause s
 	return query.String()
 }
 
-func buildOrderByClause(conf *Config, db *sql.Conn, database, table string, hasImplicitRowID bool) (string, error) { // revive:disable-line:flag-parameter
+func buildOrderByClause(tctx *tcontext.Context, conf *Config, db *BaseConn, database, table string, hasImplicitRowID bool) (string, error) { // revive:disable-line:flag-parameter
 	if !conf.SortByPk {
 		return "", nil
 	}
 	if hasImplicitRowID {
 		return orderByTiDBRowID, nil
 	}
-	cols, err := GetPrimaryKeyColumns(db, database, table)
+	cols, err := GetPrimaryKeyColumns(tctx, db, database, table)
 	if err != nil {
 		return "", errors.Trace(err)
 	}
@@ -351,18 +562,22 @@ func buildOrderByClause(conf *Config, db *sql.Conn, database, table string, hasI
 }
 
 // SelectTiDBRowID checks whether this table has _tidb_rowid column
-func SelectTiDBRowID(db *sql.Conn, database, table string) (bool, error) {
-	const errBadFieldCode = 1054
-	tiDBRowIDQuery := fmt.Sprintf("SELECT _tidb_rowid from `%s`.`%s` LIMIT 0", escapeString(database), escapeString(table))
-	_, err := db.ExecContext(context.Background(), tiDBRowIDQuery)
-	if err != nil {
-		errMsg := strings.ToLower(err.Error())
-		if strings.Contains(errMsg, fmt.Sprintf("%d", errBadFieldCode)) {
-			return false, nil
+func SelectTiDBRowID(tctx *tcontext.Context, db *BaseConn, database, table string) (bool, error) {
+	tiDBRowIDQuery := fmt.Sprintf("SELECT _tidb_rowid from `%s`.`%s` LIMIT 1", escapeString(database), escapeString(table))
+	hasImplictRowID := false
+	err := db.ExecSQL(tctx, func(_ sql.Result, err error) error {
+		if err != nil {
+			hasImplictRowID = false
+			errMsg := strings.ToLower(err.Error())
+			if strings.Contains(errMsg, fmt.Sprintf("%d", errno.ErrBadField)) {
+				return nil
+			}
+			return errors.Annotatef(err, "sql: %s", tiDBRowIDQuery)
 		}
-		return false, errors.Annotatef(err, "sql: %s", tiDBRowIDQuery)
-	}
-	return true, nil
+		hasImplictRowID = true
+		return nil
+	}, tiDBRowIDQuery)
+	return hasImplictRowID, err
 }
 
 // GetSuitableRows gets suitable rows for each table
@@ -383,26 +598,35 @@ func GetSuitableRows(avgRowLength uint64) uint64 {
 }
 
 // GetColumnTypes gets *sql.ColumnTypes from a specified table
-func GetColumnTypes(db *sql.Conn, fields, database, table string) ([]*sql.ColumnType, error) {
+func GetColumnTypes(tctx *tcontext.Context, db *BaseConn, fields, database, table string) ([]*sql.ColumnType, error) {
 	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` LIMIT 1", fields, escapeString(database), escapeString(table))
-	rows, err := db.QueryContext(context.Background(), query)
+	var colTypes []*sql.ColumnType
+	err := db.QuerySQL(tctx, func(rows *sql.Rows) error {
+		var err error
+		colTypes, err = rows.ColumnTypes()
+		if err == nil {
+			err = rows.Close()
+		}
+		failpoint.Inject("ChaosBrokenMetaConn", func(_ failpoint.Value) {
+			failpoint.Return(errors.New("connection is closed"))
+		})
+		return errors.Annotatef(err, "sql: %s", query)
+	}, func() {
+		colTypes = nil
+	}, query)
 	if err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", query)
+		return nil, err
 	}
-	defer rows.Close()
-	if err = rows.Err(); err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", query)
-	}
-	return rows.ColumnTypes()
+	return colTypes, nil
 }
 
 // GetPrimaryKeyAndColumnTypes gets all primary columns and their types in ordinal order
-func GetPrimaryKeyAndColumnTypes(conn *sql.Conn, meta TableMeta) ([]string, []string, error) {
+func GetPrimaryKeyAndColumnTypes(tctx *tcontext.Context, conn *BaseConn, meta TableMeta) ([]string, []string, error) {
 	var (
 		colNames, colTypes []string
 		err                error
 	)
-	colNames, err = GetPrimaryKeyColumns(conn, meta.DatabaseName(), meta.TableName())
+	colNames, err = GetPrimaryKeyColumns(tctx, conn, meta.DatabaseName(), meta.TableName())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -415,16 +639,13 @@ func GetPrimaryKeyAndColumnTypes(conn *sql.Conn, meta TableMeta) ([]string, []st
 }
 
 // GetPrimaryKeyColumns gets all primary columns in ordinal order
-func GetPrimaryKeyColumns(db *sql.Conn, database, table string) ([]string, error) {
+func GetPrimaryKeyColumns(tctx *tcontext.Context, db *BaseConn, database, table string) ([]string, error) {
 	priKeyColsQuery := fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", escapeString(database), escapeString(table))
-	rows, err := db.QueryContext(context.Background(), priKeyColsQuery)
+	results, err := db.QuerySQLWithColumns(tctx, []string{"KEY_NAME", "COLUMN_NAME"}, priKeyColsQuery)
 	if err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", priKeyColsQuery)
+		return nil, err
 	}
-	results, err := GetSpecifiedColumnValuesAndClose(rows, "KEY_NAME", "COLUMN_NAME")
-	if err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", priKeyColsQuery)
-	}
+
 	cols := make([]string, 0, len(results))
 	for _, oneRow := range results {
 		keyName, columnName := oneRow[0], oneRow[1]
@@ -438,17 +659,13 @@ func GetPrimaryKeyColumns(db *sql.Conn, database, table string) ([]string, error
 // getNumericIndex picks up indices according to the following priority:
 // primary key > unique key with the smallest count > key with the max cardinality
 // primary key with multi cols is before unique key with single col because we will sort result by primary keys
-func getNumericIndex(db *sql.Conn, meta TableMeta) (string, error) {
+func getNumericIndex(tctx *tcontext.Context, db *BaseConn, meta TableMeta) (string, error) {
 	database, table := meta.DatabaseName(), meta.TableName()
 	colName2Type := string2Map(meta.ColumnNames(), meta.ColumnTypes())
 	keyQuery := fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", escapeString(database), escapeString(table))
-	rows, err := db.QueryContext(context.Background(), keyQuery)
+	results, err := db.QuerySQLWithColumns(tctx, []string{"NON_UNIQUE", "SEQ_IN_INDEX", "KEY_NAME", "COLUMN_NAME", "CARDINALITY"}, keyQuery)
 	if err != nil {
-		return "", errors.Annotatef(err, "sql: %s", keyQuery)
-	}
-	results, err := GetSpecifiedColumnValuesAndClose(rows, "NON_UNIQUE", "SEQ_IN_INDEX", "KEY_NAME", "COLUMN_NAME", "CARDINALITY")
-	if err != nil {
-		return "", errors.Annotatef(err, "sql: %s", keyQuery)
+		return "", err
 	}
 	type keyColumnPair struct {
 		colName string
@@ -528,7 +745,7 @@ func UnlockTables(ctx context.Context, db *sql.Conn) error {
 }
 
 // ShowMasterStatus get SHOW MASTER STATUS result from database
-func ShowMasterStatus(db *sql.Conn) ([]string, error) {
+func ShowMasterStatus(db *sql.Conn, serverInfo version.ServerInfo) ([]string, error) {
 	var oneRow []string
 	handleOneRow := func(rows *sql.Rows) error {
 		cols, err := rows.Columns()
@@ -537,13 +754,23 @@ func ShowMasterStatus(db *sql.Conn) ([]string, error) {
 		}
 		fieldNum := len(cols)
 		oneRow = make([]string, fieldNum)
-		addr := make([]interface{}, fieldNum)
+		addr := make([]any, fieldNum)
 		for i := range oneRow {
 			addr[i] = &oneRow[i]
 		}
 		return rows.Scan(addr...)
 	}
-	const showMasterStatusQuery = "SHOW MASTER STATUS"
+
+	// MySQL 8.4.0 and newer: SHOW BINARY LOG STATUS
+	// TiDB, MariaDB, Old MySQL: SHOW MASTER STATUS
+	showMasterStatusQuery := "SHOW MASTER STATUS"
+	if serverInfo.ServerVersion != nil {
+		if serverInfo.ServerType == version.ServerTypeMySQL &&
+			!serverInfo.ServerVersion.LessThan(*minNewTerminologyMySQL) {
+			showMasterStatusQuery = "SHOW BINARY LOG STATUS"
+		}
+	}
+
 	err := simpleQuery(db, showMasterStatusQuery, handleOneRow)
 	if err != nil {
 		return nil, errors.Annotatef(err, "sql: %s", showMasterStatusQuery)
@@ -557,14 +784,13 @@ func GetSpecifiedColumnValueAndClose(rows *sql.Rows, columnName string) ([]strin
 		return []string{}, nil
 	}
 	defer rows.Close()
-	columnName = strings.ToUpper(columnName)
 	var strs []string
 	columns, _ := rows.Columns()
-	addr := make([]interface{}, len(columns))
+	addr := make([]any, len(columns))
 	oneRow := make([]sql.NullString, len(columns))
 	fieldIndex := -1
 	for i, col := range columns {
-		if strings.ToUpper(col) == columnName {
+		if strings.EqualFold(col, columnName) {
 			fieldIndex = i
 		}
 		addr[i] = &oneRow[i]
@@ -595,13 +821,13 @@ func GetSpecifiedColumnValuesAndClose(rows *sql.Rows, columnName ...string) ([][
 	if err != nil {
 		return strs, errors.Trace(err)
 	}
-	addr := make([]interface{}, len(columns))
+	addr := make([]any, len(columns))
 	oneRow := make([]sql.NullString, len(columns))
 	fieldIndexMp := make(map[int]int)
 	for i, col := range columns {
 		addr[i] = &oneRow[i]
 		for j, name := range columnName {
-			if strings.ToUpper(col) == name {
+			if strings.EqualFold(col, name) {
 				fieldIndexMp[i] = j
 			}
 		}
@@ -673,10 +899,12 @@ func getTiDBConfig(db *sql.Conn) (dbconfig.Config, error) {
 func CheckTiDBWithTiKV(db *sql.DB) (bool, error) {
 	conn, err := db.Conn(context.Background())
 	if err == nil {
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 		tidbConfig, err := getTiDBConfig(conn)
 		if err == nil {
-			return tidbConfig.Store == "tikv", nil
+			return tidbConfig.Store == dbconfig.StoreTypeTiKV, nil
 		}
 	}
 	var count int
@@ -691,6 +919,19 @@ func CheckTiDBWithTiKV(db *sql.DB) (bool, error) {
 	return count > 0, nil
 }
 
+// checkIfSeqExists use sql to check whether sequence exists
+func checkIfSeqExists(db *sql.Conn) (bool, error) {
+	var count int
+	const query = "SELECT COUNT(1) as c FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='SEQUENCE'"
+	row := db.QueryRowContext(context.Background(), query)
+	err := row.Scan(&count)
+	if err != nil {
+		return false, errors.Annotatef(err, "sql: %s", query)
+	}
+
+	return count > 0, nil
+}
+
 // CheckTiDBEnableTableLock use sql variable to check whether current TiDB has TiKV
 func CheckTiDBEnableTableLock(db *sql.Conn) (bool, error) {
 	tidbConfig, err := getTiDBConfig(db)
@@ -701,7 +942,10 @@ func CheckTiDBEnableTableLock(db *sql.Conn) (bool, error) {
 }
 
 func getSnapshot(db *sql.Conn) (string, error) {
-	str, err := ShowMasterStatus(db)
+	serverInfo := version.ServerInfo{
+		ServerType: version.ServerTypeTiDB,
+	}
+	str, err := ShowMasterStatus(db, serverInfo)
 	if err != nil {
 		return "", err
 	}
@@ -714,10 +958,10 @@ func isUnknownSystemVariableErr(err error) bool {
 
 // resetDBWithSessionParams will return a new sql.DB as a replacement for input `db` with new session parameters.
 // If returned error is nil, the input `db` will be closed.
-func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, dsn string, params map[string]interface{}) (*sql.DB, error) {
-	support := make(map[string]interface{})
+func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, cfg *mysql.Config, params map[string]any) (*sql.DB, error) {
+	support := make(map[string]any)
 	for k, v := range params {
-		var pv interface{}
+		var pv any
 		if str, ok := v.(string); ok {
 			if pvi, err := strconv.ParseInt(str, 10, 64); err == nil {
 				pv = pvi
@@ -732,7 +976,9 @@ func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, dsn string, pa
 		s := fmt.Sprintf("SET SESSION %s = ?", k)
 		_, err := db.ExecContext(tctx, s, pv)
 		if err != nil {
-			if isUnknownSystemVariableErr(err) {
+			if k == snapshotVar {
+				err = errors.Annotate(err, "fail to set snapshot for tidb, please set --consistency=none/--consistency=lock or fix snapshot problem")
+			} else if isUnknownSystemVariableErr(err) {
 				tctx.L().Info("session variable is not supported by db", zap.String("variable", k), zap.Reflect("value", v))
 				continue
 			}
@@ -740,6 +986,10 @@ func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, dsn string, pa
 		}
 
 		support[k] = pv
+	}
+
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string)
 	}
 
 	for k, v := range support {
@@ -751,14 +1001,24 @@ func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, dsn string, pa
 		} else {
 			s = fmt.Sprintf("%v", v)
 		}
-		dsn += fmt.Sprintf("&%s=%s", k, url.QueryEscape(s))
+		cfg.Params[k] = s
 	}
+	failpoint.Inject("SkipResetDB", func(_ failpoint.Value) {
+		failpoint.Return(db, nil)
+	})
 
-	newDB, err := sql.Open("mysql", dsn)
-	if err == nil {
-		db.Close()
+	db.Close()
+	c, err := mysql.NewConnector(cfg)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
-	return newDB, errors.Trace(err)
+	newDB := sql.OpenDB(c)
+	// ping to make sure all session parameters are set correctly
+	err = newDB.PingContext(tctx)
+	if err != nil {
+		newDB.Close()
+	}
+	return newDB, nil
 }
 
 func createConnWithConsistency(ctx context.Context, db *sql.DB, repeatableRead bool) (*sql.Conn, error) {
@@ -791,20 +1051,14 @@ func createConnWithConsistency(ctx context.Context, db *sql.DB, repeatableRead b
 
 // buildSelectField returns the selecting fields' string(joined by comma(`,`)),
 // and the number of writable fields.
-func buildSelectField(db *sql.Conn, dbName, tableName string, completeInsert bool) (string, int, error) { // revive:disable-line:flag-parameter
+func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName string, completeInsert bool) (string, int, error) { // revive:disable-line:flag-parameter
 	query := fmt.Sprintf("SHOW COLUMNS FROM `%s`.`%s`", escapeString(dbName), escapeString(tableName))
-	rows, err := db.QueryContext(context.Background(), query)
+	results, err := db.QuerySQLWithColumns(tctx, []string{"FIELD", "EXTRA"}, query)
 	if err != nil {
-		return "", 0, errors.Annotatef(err, "sql: %s", query)
+		return "", 0, err
 	}
-	defer rows.Close()
 	availableFields := make([]string, 0)
-
 	hasGenerateColumn := false
-	results, err := GetSpecifiedColumnValuesAndClose(rows, "FIELD", "EXTRA")
-	if err != nil {
-		return "", 0, errors.Annotatef(err, "sql: %s", query)
-	}
 	for _, oneRow := range results {
 		fieldName, extra := oneRow[0], oneRow[1]
 		switch extra {
@@ -963,7 +1217,7 @@ func buildOrderByClauseString(handleColNames []string) string {
 	return fmt.Sprintf("ORDER BY %s", strings.Join(quotaCols, separator))
 }
 
-func buildLockTablesSQL(allTables DatabaseTables, blockList map[string]map[string]interface{}) string {
+func buildLockTablesSQL(allTables DatabaseTables, blockList map[string]map[string]any) string {
 	// ,``.`` READ has 11 bytes, "LOCK TABLE" has 10 bytes
 	estimatedCap := len(allTables)*11 + 10
 	s := bytes.NewBuffer(make([]byte, 0, estimatedCap))
@@ -1005,34 +1259,41 @@ func (o *oneStrColumnTable) handleOneRow(rows *sql.Rows) error {
 	return nil
 }
 
-func simpleQuery(conn *sql.Conn, sql string, handleOneRow func(*sql.Rows) error) error {
-	return simpleQueryWithArgs(conn, handleOneRow, sql)
+func simpleQuery(conn *sql.Conn, query string, handleOneRow func(*sql.Rows) error) error {
+	return simpleQueryWithArgs(context.Background(), conn, handleOneRow, query)
 }
 
-func simpleQueryWithArgs(conn *sql.Conn, handleOneRow func(*sql.Rows) error, sql string, args ...interface{}) error {
-	rows, err := conn.QueryContext(context.Background(), sql, args...)
+func simpleQueryWithArgs(ctx context.Context, conn *sql.Conn, handleOneRow func(*sql.Rows) error, query string, args ...any) error {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if len(args) > 0 {
+		rows, err = conn.QueryContext(ctx, query, args...)
+	} else {
+		rows, err = conn.QueryContext(ctx, query)
+	}
 	if err != nil {
-		return errors.Annotatef(err, "sql: %s, args: %s", sql, args)
+		return errors.Annotatef(err, "sql: %s, args: %s", query, args)
 	}
 	defer rows.Close()
 
 	for rows.Next() {
 		if err := handleOneRow(rows); err != nil {
 			rows.Close()
-			return errors.Annotatef(err, "sql: %s, args: %s", sql, args)
+			return errors.Annotatef(err, "sql: %s, args: %s", query, args)
 		}
 	}
-	rows.Close()
-	return errors.Annotatef(rows.Err(), "sql: %s, args: %s", sql, args)
+	return errors.Annotatef(rows.Err(), "sql: %s, args: %s", query, args)
 }
 
-func pickupPossibleField(meta TableMeta, db *sql.Conn) (string, error) {
+func pickupPossibleField(tctx *tcontext.Context, meta TableMeta, db *BaseConn) (string, error) {
 	// try using _tidb_rowid first
 	if meta.HasImplicitRowID() {
 		return "_tidb_rowid", nil
 	}
 	// try to use pk or uk
-	fieldName, err := getNumericIndex(db, meta)
+	fieldName, err := getNumericIndex(tctx, db, meta)
 	if err != nil {
 		return "", err
 	}
@@ -1041,7 +1302,7 @@ func pickupPossibleField(meta TableMeta, db *sql.Conn) (string, error) {
 	return fieldName, nil
 }
 
-func estimateCount(tctx *tcontext.Context, dbName, tableName string, db *sql.Conn, field string, conf *Config) uint64 {
+func estimateCount(tctx *tcontext.Context, dbName, tableName string, db *BaseConn, field string, conf *Config) uint64 {
 	var query string
 	if strings.TrimSpace(field) == "*" || strings.TrimSpace(field) == "" {
 		query = fmt.Sprintf("EXPLAIN SELECT * FROM `%s`.`%s`", escapeString(dbName), escapeString(tableName))
@@ -1083,44 +1344,39 @@ func estimateCount(tctx *tcontext.Context, dbName, tableName string, db *sql.Con
 	return 0
 }
 
-func detectEstimateRows(tctx *tcontext.Context, db *sql.Conn, query string, fieldNames []string) uint64 {
-	rows, err := db.QueryContext(tctx, query)
-	if err != nil {
-		tctx.L().Info("can't estimate rows from db",
-			zap.String("query", query), log.ShortError(err))
-		return 0
-	}
-	defer rows.Close()
-	rows.Next()
-	columns, err := rows.Columns()
-	if err != nil {
-		tctx.L().Info("can't get columns when estimate rows from db",
-			zap.String("query", query), log.ShortError(err))
-		return 0
-	}
-	err = rows.Err()
-	if err != nil {
-		tctx.L().Info("rows meet some error during the query when estimate rows",
-			zap.String("query", query), log.ShortError(err))
-		return 0
-	}
-	addr := make([]interface{}, len(columns))
-	oneRow := make([]sql.NullString, len(columns))
-	fieldIndex := -1
-	for i := range oneRow {
-		addr[i] = &oneRow[i]
-	}
-found:
-	for i := range oneRow {
-		for _, fieldName := range fieldNames {
-			if strings.EqualFold(columns[i], fieldName) {
-				fieldIndex = i
-				break found
+func detectEstimateRows(tctx *tcontext.Context, db *BaseConn, query string, fieldNames []string) uint64 {
+	var (
+		fieldIndex int
+		oneRow     []sql.NullString
+	)
+	err := db.QuerySQL(tctx, func(rows *sql.Rows) error {
+		columns, err := rows.Columns()
+		if err != nil {
+			return errors.Trace(err)
+		}
+		addr := make([]any, len(columns))
+		oneRow = make([]sql.NullString, len(columns))
+		fieldIndex = -1
+	found:
+		for i := range oneRow {
+			for _, fieldName := range fieldNames {
+				if strings.EqualFold(columns[i], fieldName) {
+					fieldIndex = i
+					break found
+				}
 			}
 		}
-	}
-	err = rows.Scan(addr...)
-	if err != nil || fieldIndex < 0 {
+		if fieldIndex == -1 {
+			rows.Close()
+			return nil
+		}
+
+		for i := range oneRow {
+			addr[i] = &oneRow[i]
+		}
+		return rows.Scan(addr...)
+	}, func() {}, query)
+	if err != nil || fieldIndex == -1 {
 		tctx.L().Info("can't estimate rows from db",
 			zap.String("query", query), zap.Int("fieldIndex", fieldIndex), log.ShortError(err))
 		return 0
@@ -1129,10 +1385,9 @@ found:
 	estRows, err := strconv.ParseFloat(oneRow[fieldIndex].String, 64)
 	if err != nil {
 		tctx.L().Info("can't get parse estimate rows from db",
-			zap.String("query", query), log.ShortError(err))
+			zap.String("query", query), zap.String("estRows", oneRow[fieldIndex].String), log.ShortError(err))
 		return 0
 	}
-
 	return uint64(estRows)
 }
 
@@ -1184,10 +1439,10 @@ func escapeString(s string) string {
 }
 
 // GetPartitionNames get partition names from a specified table
-func GetPartitionNames(db *sql.Conn, schema, table string) (partitions []string, err error) {
+func GetPartitionNames(tctx *tcontext.Context, db *BaseConn, schema, table string) (partitions []string, err error) {
 	partitions = make([]string, 0)
 	var partitionName sql.NullString
-	err = simpleQueryWithArgs(db, func(rows *sql.Rows) error {
+	err = db.QuerySQL(tctx, func(rows *sql.Rows) error {
 		err := rows.Scan(&partitionName)
 		if err != nil {
 			return errors.Trace(err)
@@ -1196,6 +1451,8 @@ func GetPartitionNames(db *sql.Conn, schema, table string) (partitions []string,
 			partitions = append(partitions, partitionName.String)
 		}
 		return nil
+	}, func() {
+		partitions = partitions[:0]
 	}, "SELECT PARTITION_NAME from INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", schema, table)
 	return
 }
@@ -1302,10 +1559,9 @@ func GetDBInfo(db *sql.Conn, tables map[string]map[string]struct{}) ([]*model.DB
 		}
 		last := len(schemas) - 1
 		if last < 0 || schemas[last].Name.O != tableSchema {
-			schemas = append(schemas, &model.DBInfo{
-				Name:   model.CIStr{O: tableSchema},
-				Tables: make([]*model.TableInfo, 0, len(tables[tableSchema])),
-			})
+			dbInfo := &model.DBInfo{Name: ast.CIStr{O: tableSchema}}
+			dbInfo.Deprecated.Tables = make([]*model.TableInfo, 0, len(tables[tableSchema]))
+			schemas = append(schemas, dbInfo)
 			last++
 		}
 		var partition *model.PartitionInfo
@@ -1315,14 +1571,14 @@ func GetDBInfo(db *sql.Conn, tables map[string]map[string]struct{}) ([]*model.DB
 				for partitionName, partitionID := range ptm {
 					partition.Definitions = append(partition.Definitions, model.PartitionDefinition{
 						ID:   partitionID,
-						Name: model.CIStr{O: partitionName},
+						Name: ast.CIStr{O: partitionName},
 					})
 				}
 			}
 		}
-		schemas[last].Tables = append(schemas[last].Tables, &model.TableInfo{
+		schemas[last].Deprecated.Tables = append(schemas[last].Deprecated.Tables, &model.TableInfo{
 			ID:        tidbTableID,
-			Name:      model.CIStr{O: tableName},
+			Name:      ast.CIStr{O: tableName},
 			Partition: partition,
 		})
 		return nil
@@ -1332,19 +1588,19 @@ func GetDBInfo(db *sql.Conn, tables map[string]map[string]struct{}) ([]*model.DB
 
 // GetRegionInfos get region info including regionID, start key, end key from database sql interface.
 // start key, end key includes information to help split table
-func GetRegionInfos(db *sql.Conn) (*helper.RegionsInfo, error) {
+func GetRegionInfos(db *sql.Conn) (*pd.RegionsInfo, error) {
 	const tableRegionSQL = "SELECT REGION_ID,START_KEY,END_KEY FROM INFORMATION_SCHEMA.TIKV_REGION_STATUS ORDER BY START_KEY;"
 	var (
 		regionID         int64
 		startKey, endKey string
 	)
-	regionsInfo := &helper.RegionsInfo{Regions: make([]helper.RegionInfo, 0)}
+	regionsInfo := &pd.RegionsInfo{Regions: make([]pd.RegionInfo, 0)}
 	err := simpleQuery(db, tableRegionSQL, func(rows *sql.Rows) error {
 		err := rows.Scan(&regionID, &startKey, &endKey)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		regionsInfo.Regions = append(regionsInfo.Regions, helper.RegionInfo{
+		regionsInfo.Regions = append(regionsInfo.Regions, pd.RegionInfo{
 			ID:       regionID,
 			StartKey: startKey,
 			EndKey:   endKey,
@@ -1352,4 +1608,47 @@ func GetRegionInfos(db *sql.Conn) (*helper.RegionsInfo, error) {
 		return nil
 	})
 	return regionsInfo, err
+}
+
+// GetCharsetAndDefaultCollation gets charset and default collation map.
+func GetCharsetAndDefaultCollation(ctx context.Context, db *sql.Conn) (map[string]string, error) {
+	charsetAndDefaultCollation := make(map[string]string)
+	query := "SHOW CHARACTER SET"
+
+	// Show an example.
+	/*
+		mysql> SHOW CHARACTER SET;
+		+----------+---------------------------------+---------------------+--------+
+		| Charset  | Description                     | Default collation   | Maxlen |
+		+----------+---------------------------------+---------------------+--------+
+		| armscii8 | ARMSCII-8 Armenian              | armscii8_general_ci |      1 |
+		| ascii    | US ASCII                        | ascii_general_ci    |      1 |
+		| big5     | Big5 Traditional Chinese        | big5_chinese_ci     |      2 |
+		| binary   | Binary pseudo charset           | binary              |      1 |
+		| cp1250   | Windows Central European        | cp1250_general_ci   |      1 |
+		| cp1251   | Windows Cyrillic                | cp1251_general_ci   |      1 |
+		+----------+---------------------------------+---------------------+--------+
+	*/
+
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, errors.Annotatef(err, "sql: %s", query)
+	}
+
+	defer rows.Close()
+	for rows.Next() {
+		var charset, description, collation string
+		var maxlen int
+		if scanErr := rows.Scan(&charset, &description, &collation, &maxlen); scanErr != nil {
+			return nil, errors.Annotatef(err, "sql: %s", query)
+		}
+		charsetAndDefaultCollation[strings.ToLower(charset)] = collation
+	}
+	if err = rows.Close(); err != nil {
+		return nil, errors.Annotatef(err, "sql: %s", query)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, errors.Annotatef(err, "sql: %s", query)
+	}
+	return charsetAndDefaultCollation, err
 }

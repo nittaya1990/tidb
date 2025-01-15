@@ -8,11 +8,17 @@ cur=$(cd `dirname $0`; pwd)
 DB_NAME="mysql_consistency"
 TABLE_NAME="t"
 
+# get version info
+# MySQL:   VERSION(): 9.1.0
+# MariaDB: VERSION(): 11.4.2-MariaDB-ubu2404
+# TiDB:    VERSION(): 8.0.11-TiDB-v8.3.0
+versioninfo=`run_sql "SELECT VERSION();"`
+
 # drop database on mysql
 run_sql "drop database if exists \`$DB_NAME\`;"
 
 # build data on mysql
-run_sql "create database $DB_NAME;"
+run_sql "create database $DB_NAME DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;"
 run_sql "create table $DB_NAME.$TABLE_NAME (a int(255));"
 
 # insert 100 records
@@ -26,7 +32,17 @@ run_dumpling &
 sleep 2
 
 # record metadata info
-metadata=`run_sql "show master status;"`
+if [[ $versioninfo =~ (Ti|Maria)DB ]]; then
+	metadata=`run_sql "show master status;"`
+else
+	if [[ $versioninfo =~ "VERSION(): "(8.4|9) ]]; then
+		# MySQL 8.4.0 and newer no longer support SHOW MASTER STATUS
+		# and only support SHOW BINARY LOG STATUS
+		metadata=`run_sql "show binary log status;"`
+	else
+		metadata=`run_sql "show master status;"`
+	fi
+fi
 metaLog=`echo $metadata | awk -F 'File:' '{print $2}' | awk '{print $1}'`
 metaPos=`echo $metadata | awk -F 'Position:' '{print $2}' | awk '{print $1}'`
 metaGTID=`echo $metadata | awk -F 'Executed_Gtid_Set:' '{print $2}' | awk '{print $1}'`
